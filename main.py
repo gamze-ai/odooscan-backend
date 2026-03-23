@@ -283,11 +283,11 @@ async def send_to_odoo(req: SendToOdooRequest):
 
     # ── G. Aksiyon ──────────────────────────────────────────────────────────
     aksiyon_map = {
-        'ZİYARET': 'ziyaret', 'ZIYARET': 'ziyaret',
-        'TANITIM': 'tanitim',
-        'FİYAT TEKLİFİ': 'fiyat_teklifi', 'FIYAT TEKLIFI': 'fiyat_teklifi',
-        'ARAMA': 'arama', 'CRM': 'crm',
-    }
+    'ZİYARET': 'Ziyaret', 'ZIYARET': 'Ziyaret',
+    'TANITIM': 'Tanıtım', 'TANITIM': 'Tanıtım',
+    'FİYAT TEKLİFİ': 'Ziyaret',  # Odoo'da yok, varsayılan
+    'ARAMA': 'Arama', 'CRM': 'CRM',
+}
     aksiyon = aksiyon_map.get(ff.get('aksiyon_plan','').upper().strip(), '')
 
     # ── H. Ziyaret kaydı ────────────────────────────────────────────────────
