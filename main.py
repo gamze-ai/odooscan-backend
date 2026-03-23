@@ -15,6 +15,19 @@ from pydantic import BaseModel
 
 from contact_matcher import ContactMatcher, serialize_candidates
 
+def _convert_date(date_str):
+    """GG.AA.YYYY formatını YYYY-MM-DD'ye çevirir"""
+    if not date_str: return False
+    try:
+        parts = date_str.replace('/', '.').replace('-', '.').split('.')
+        if len(parts) == 3:
+            if len(parts[2]) == 4:  # GG.AA.YYYY
+                return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+            else:  # YYYY-MM-DD zaten
+                return date_str
+    except:
+        return False
+
 app = FastAPI(title="OdooScan API", version="2.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 claude_client = anthropic.Anthropic()
@@ -298,7 +311,7 @@ async def send_to_odoo(req: SendToOdooRequest):
     visit_vals = {k: v for k, v in {
         'x_name': ff.get('fuar_adi', ''),
         'x_studio_field_YnEYp': company_id,
-        'x_studio_field_SnOyH': ff.get('tarih', ''),
+        'x_studio_field_SnOyH': _convert_date(ff.get('tarih', '')),
         'x_studio_grlen': g1 or contact_id,
         'x_studio_grlen_2_kii': g2,
         'x_studio_aksiyon_sorumlusu': u1,
