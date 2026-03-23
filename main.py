@@ -1,12 +1,13 @@
 """
-main.py — OdooScan Backend API
+main.py — OdooScan Backend API v2.0
 OCR + AI extraction + Odoo kontak eşleştirme + kayıt oluşturma
+MABAYCO Fuar Görüşme Raporu + Kartvizit entegrasyonu
 """
 
 import base64
 import re
+import json
 import xmlrpc.client
-from io import BytesIO
 from typing import Optional
 
 import anthropic
@@ -14,58 +15,42 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from contact_matcher import ContactMatcher, normalize_name, normalize_company, serialize_candidates
+from contact_matcher import ContactMatcher, serialize_candidates
 
-app = FastAPI(title="OdooScan API", version="1.0.0")
+app = FastAPI(title="OdooScan API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+claude_client = anthropic.Anthropic()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-claude_client = anthropic.Anthropic()  # ANTHROPIC_API_KEY env var'dan okur
-
-
-# ─── Pydantic Modeller ────────────────────────────────────────────────────────
-
+# ─── Modeller ─────────────────────────────────────────────────────────────────
 class OdooConfig(BaseModel):
     url: str
     db: str
     username: str
     api_key: str
 
-
 class ExtractRequest(BaseModel):
     file_base64: str
-    mime_type: str          # image/jpeg | image/png | application/pdf
-    document_type: str      # businessCard | handwrittenForm | pdf
-    custom_fields: list[dict] = []   # [{key, label}]
-
+    mime_type: str
+    document_type: str  # 'form' | 'businessCard' | 'both'
 
 class CheckContactRequest(BaseModel):
     odoo_config: OdooConfig
-    name: str
+    name: str = ''
     company_name: str = ''
     email: str = ''
     phone: str = ''
 
-
 class SendToOdooRequest(BaseModel):
     odoo_config: OdooConfig
-    contact_fields: dict
-    custom_fields: dict = {}
-    custom_module: str = 'x_scanned_document'
-    # Kullanıcı mobilde seçim yaptıysa bu ID'ler gelir
-    selected_contact_id: Optional[int] = None    # mevcut kontağı kullan
-    selected_company_id: Optional[int] = None    # mevcut şirketi kullan
-    create_new_contact: bool = False              # yeni kontak oluştur
+    scan_type: str
+    form_fields: dict = {}
+    card_fields: dict = {}
+    manual_fields: dict = {}
+    selected_contact_id: Optional[int] = None
+    selected_company_id: Optional[int] = None
 
-
-# ─── Yardımcı: Odoo XML-RPC bağlantısı ───────────────────────────────────────
-
-def get_odoo_models(cfg: OdooConfig):
+# ─── Odoo ─────────────────────────────────────────────────────────────────────
+def get_odoo(cfg: OdooConfig):
     common = xmlrpc.client.ServerProxy(f'{cfg.url.rstrip("/")}/xmlrpc/2/common')
     uid = common.authenticate(cfg.db, cfg.username, cfg.api_key, {})
     if not uid:
@@ -73,260 +58,263 @@ def get_odoo_models(cfg: OdooConfig):
     models = xmlrpc.client.ServerProxy(f'{cfg.url.rstrip("/")}/xmlrpc/2/object')
     return models, uid
 
-
-def odoo_call(models, cfg: OdooConfig, uid: int, model: str, method: str, args, kwargs=None):
+def odoo_call(models, cfg, uid, model, method, args, kwargs=None):
     return models.execute_kw(cfg.db, uid, cfg.api_key, model, method, args, kwargs or {})
 
+# ─── AI Promptları ────────────────────────────────────────────────────────────
+FORM_PROMPT = """Bu bir FUAR GÖRÜŞME RAPORU formudur.
+Formdan bilgileri çıkar ve SADECE JSON döndür. Emin olmadığın alanlara boş string koy.
 
-# ─── 1. OCR + AI Extraction ───────────────────────────────────────────────────
+{
+  "fuar_adi": "",
+  "sirket": "",
+  "tarih": "GG.AA.YYYY formatında",
+  "gorusulen_1": "",
+  "gorusulen_1_tel": "",
+  "gorusulen_1_mail": "",
+  "gorusulen_2": "",
+  "gorusulen_2_tel": "",
+  "gorusulen_2_mail": "",
+  "gorusme_yapan_1": "",
+  "gorusme_yapan_2": "",
+  "gorusme_yapan_3": "",
+  "notlar": "",
+  "aksiyon_plan": "ZİYARET veya TANITIM veya FİYAT TEKLİFİ veya ARAMA veya CRM",
+  "oncelik": "AZ veya ORTA veya ÇOK"
+}"""
 
+CARD_PROMPT = """Bu bir KARTVİZİT fotoğrafıdır.
+Kartvizitteki bilgileri çıkar ve SADECE JSON döndür. Emin olmadığın alanlara boş string koy.
+
+{
+  "name": "",
+  "company": "",
+  "function": "",
+  "phone": "",
+  "mobile": "",
+  "email": "",
+  "website": "",
+  "street": "",
+  "city": "ilçe",
+  "state": "şehir",
+  "zip": "",
+  "country": ""
+}"""
+
+BOTH_PROMPT = """Bu görüntüde hem FUAR GÖRÜŞME RAPORU formu hem de KARTVİZİT var.
+Her ikisinden bilgileri ayrı ayrı çıkar ve SADECE JSON döndür.
+
+{
+  "form": {
+    "fuar_adi": "", "sirket": "", "tarih": "",
+    "gorusulen_1": "", "gorusulen_1_tel": "", "gorusulen_1_mail": "",
+    "gorusulen_2": "", "gorusulen_2_tel": "", "gorusulen_2_mail": "",
+    "gorusme_yapan_1": "", "gorusme_yapan_2": "", "gorusme_yapan_3": "",
+    "notlar": "", "aksiyon_plan": "", "oncelik": ""
+  },
+  "card": {
+    "name": "", "company": "", "function": "",
+    "phone": "", "mobile": "", "email": "", "website": "",
+    "street": "", "city": "", "state": "", "zip": "", "country": ""
+  }
+}"""
+
+# ─── 1. Extract ───────────────────────────────────────────────────────────────
 @app.post('/api/extract')
 async def extract(req: ExtractRequest):
-    """
-    Belgeden (kartvizit/form/pdf) bilgileri çıkar.
-    Claude Vision API kullanır.
-    """
-    # PDF → sayfa görüntüsüne çevir
     if req.mime_type == 'application/pdf':
-        image_content = _pdf_to_image_base64(req.file_base64)
+        image_b64 = _pdf_to_image(req.file_base64)
         mime = 'image/png'
     else:
-        image_content = req.file_base64
+        image_b64 = req.file_base64
         mime = req.mime_type
 
-    # Özel alan listesi varsa prompt'a ekle
-    custom_fields_prompt = ''
-    if req.custom_fields:
-        field_list = '\n'.join(f'  - {f["key"]}: {f["label"]}' for f in req.custom_fields)
-        custom_fields_prompt = f"""
-Ayrıca belgeden şu ÖZEL ALANLARI da çıkar (yoksa boş bırak):
-{field_list}
-Bu alanları "custom_fields" anahtarı altında ver.
-"""
+    prompt = {'form': FORM_PROMPT, 'businessCard': CARD_PROMPT, 'both': BOTH_PROMPT}.get(req.document_type, FORM_PROMPT)
 
-    doc_context = {
-        'businessCard': 'Bu bir kartvizit fotoğrafıdır.',
-        'handwrittenForm': 'Bu el yazısıyla doldurulmuş bir formdur.',
-        'pdf': 'Bu bir PDF form belgesidir.',
-    }.get(req.document_type, 'Bu bir belge fotoğrafıdır.')
-
-    prompt = f"""
-{doc_context}
-
-Belgeden aşağıdaki bilgileri çıkar ve SADECE JSON formatında döndür.
-Emin olmadığın alanlara boş string koy. Tahmin etme.
-
-Döndür:
-{{
-  "contact_fields": {{
-    "name": "kişinin tam adı (tam olarak belgede yazdığı gibi)",
-    "company": "şirket adı (tam olarak belgede yazdığı gibi)",
-    "job_title": "unvan/pozisyon",
-    "phone": "sabit hat",
-    "mobile": "cep telefonu",
-    "email": "e-posta",
-    "website": "web sitesi",
-    "street": "adres",
-    "city": "şehir",
-    "country": "ülke",
-    "notes": "belgede diğer önemli notlar"
-  }},
-  "custom_fields": {{}}
-}}
-{custom_fields_prompt}
-JSON dışında hiçbir şey yazma.
-"""
-
-    message = claude_client.messages.create(
-        model='claude-opus-4-5',
-        max_tokens=1000,
-        messages=[{
-            'role': 'user',
-            'content': [
-                {
-                    'type': 'image',
-                    'source': {
-                        'type': 'base64',
-                        'media_type': mime,
-                        'data': image_content,
-                    },
-                },
-                {'type': 'text', 'text': prompt},
-            ],
-        }],
+    msg = claude_client.messages.create(
+        model='claude-opus-4-5', max_tokens=1500,
+        messages=[{'role': 'user', 'content': [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': mime, 'data': image_b64}},
+            {'type': 'text', 'text': prompt},
+        ]}],
     )
 
-    raw = message.content[0].text.strip()
-    # JSON fence temizle
-    raw = re.sub(r'^```json\s*', '', raw)
+    raw = re.sub(r'^```json\s*', '', msg.content[0].text.strip())
     raw = re.sub(r'```$', '', raw).strip()
 
-    import json
     try:
         data = json.loads(raw)
     except Exception:
-        raise HTTPException(status_code=500, detail=f'AI yanıtı parse edilemedi: {raw[:200]}')
+        raise HTTPException(status_code=500, detail=f'Parse hatası: {raw[:300]}')
 
-    return data
+    if req.document_type == 'both':
+        return {'form_fields': data.get('form', {}), 'card_fields': data.get('card', {})}
+    elif req.document_type == 'businessCard':
+        return {'card_fields': data, 'form_fields': {}}
+    else:
+        return {'form_fields': data, 'card_fields': {}}
 
-
-def _pdf_to_image_base64(pdf_b64: str) -> str:
-    """PDF'in ilk sayfasını PNG'ye çevir"""
+def _pdf_to_image(pdf_b64):
     try:
-        import fitz  # PyMuPDF
-        pdf_bytes = base64.b64decode(pdf_b64)
-        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
-        page = doc[0]
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes('png')
-        return base64.b64encode(img_bytes).decode()
+        import fitz
+        doc = fitz.open(stream=base64.b64decode(pdf_b64), filetype='pdf')
+        pix = doc[0].get_pixmap(dpi=200)
+        return base64.b64encode(pix.tobytes('png')).decode()
     except ImportError:
-        # PyMuPDF yoksa pdf_b64'ü direkt dön (bazı modeller PDF kabul eder)
         return pdf_b64
 
-
-# ─── 2. Kontak Eşleşme Kontrolü ──────────────────────────────────────────────
-
+# ─── 2. Kontak Kontrolü ───────────────────────────────────────────────────────
 @app.post('/api/check-contact')
 async def check_contact(req: CheckContactRequest):
-    """
-    Odoo'da kontak fuzzy search yap.
-    Mobil uygulama bu endpoint'i çağırır, kullanıcıya aday listesi gösterir.
-    """
     try:
-        matcher = _build_matcher(req.odoo_config)
-        contact_candidates = matcher.find_contact_candidates(
-            name=req.name,
-            company_name=req.company_name,
-            email=req.email,
-            phone=req.phone,
-        )
-        company_candidates = matcher.find_company_candidates(req.company_name) if req.company_name else []
-
+        matcher = ContactMatcher(req.odoo_config.url, req.odoo_config.db, req.odoo_config.username, req.odoo_config.api_key)
+        matcher._stored_api_key = req.odoo_config.api_key
+        contacts = matcher.find_contact_candidates(req.name, req.company_name, req.email, req.phone)
+        companies = matcher.find_company_candidates(req.company_name) if req.company_name else []
         return {
-            'contact_candidates': serialize_candidates(contact_candidates),
-            'company_candidates': serialize_candidates(company_candidates),
-            'has_exact_contact': any(c.match_type == 'exact' for c in contact_candidates),
-            'has_exact_company': any(c.match_type == 'exact' for c in company_candidates),
+            'contact_candidates': serialize_candidates(contacts),
+            'company_candidates': serialize_candidates(companies),
+            'has_exact_contact': any(c.match_type == 'exact' for c in contacts),
+            'has_exact_company': any(c.match_type == 'exact' for c in companies),
         }
-    except ConnectionError as e:
-        raise HTTPException(status_code=401, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-def _build_matcher(cfg: OdooConfig) -> ContactMatcher:
-    matcher = ContactMatcher(cfg.url, cfg.db, cfg.username, cfg.api_key)
-    matcher._stored_api_key = cfg.api_key
-    return matcher
-
-
 # ─── 3. Odoo'ya Kaydet ───────────────────────────────────────────────────────
-
 @app.post('/api/send-to-odoo')
 async def send_to_odoo(req: SendToOdooRequest):
-    """
-    Kontak + şirket + özel modül kaydını Odoo'ya oluştur/güncelle.
-    Kullanıcı mobilde zaten bir seçim yaptıysa (selected_contact_id),
-    yeni kontak oluşturmaz, mevcut ID'yi kullanır.
-    """
-    models, uid = get_odoo_models(req.odoo_config)
+    models, uid = get_odoo(req.odoo_config)
     cfg = req.odoo_config
-    cf = req.contact_fields
+    ff, cf, mf = req.form_fields, req.card_fields, req.manual_fields
     result = {}
 
-    # ── Şirket ID'si bul veya oluştur ──────────────────────────────────────
+    # A. Şirket
+    company_name = cf.get('company') or ff.get('sirket') or ''
     company_id = req.selected_company_id
-    if not company_id and cf.get('company'):
-        # Son bir kontrol (kullanıcı seçmemiş olabilir ama tam eşleşme var)
-        existing = odoo_call(models, cfg, uid, 'res.partner', 'search_read',
-            [[['is_company', '=', True], ['name', '=ilike', cf['company']]]],
-            {'fields': ['id', 'name'], 'limit': 1}
-        )
-        if existing:
-            company_id = existing[0]['id']
+    if not company_id and company_name:
+        ex = odoo_call(models, cfg, uid, 'res.partner', 'search_read',
+            [[['is_company', '=', True], ['name', '=ilike', company_name]]],
+            {'fields': ['id'], 'limit': 1})
+        if ex:
+            company_id = ex[0]['id']
             result['company_existed'] = True
         else:
             company_id = odoo_call(models, cfg, uid, 'res.partner', 'create',
-                [{'name': cf['company'], 'is_company': True}]
-            )
+                [{'name': company_name, 'is_company': True}])
             result['company_created'] = True
             result['company_id'] = company_id
 
-    # ── Kontak ID'si bul veya oluştur ──────────────────────────────────────
+    # B. Kartvizit kontağı
     contact_id = req.selected_contact_id
-
-    if not contact_id:
-        # Yeni kontak oluştur
-        partner_vals = {
+    if not contact_id and cf and cf.get('name'):
+        vals = {k: v for k, v in {
             'is_company': False,
             'name': cf.get('name', ''),
-            'job_title': cf.get('job_title', ''),
+            'function': cf.get('function', ''),
             'phone': cf.get('phone', ''),
             'mobile': cf.get('mobile', ''),
             'email': cf.get('email', ''),
             'website': cf.get('website', ''),
             'street': cf.get('street', ''),
             'city': cf.get('city', ''),
-            'comment': cf.get('notes', ''),
-        }
-        if company_id:
-            partner_vals['parent_id'] = company_id
+            'zip': cf.get('zip', ''),
+        }.items() if v}
+        if company_id: vals['parent_id'] = company_id
+        # state_id
+        if cf.get('state'):
+            s = odoo_call(models, cfg, uid, 'res.country.state', 'search',
+                [[['name', 'ilike', cf['state']]]], {'limit': 1})
+            if s: vals['state_id'] = s[0]
+        # country_id
         if cf.get('country'):
-            country_ids = odoo_call(models, cfg, uid, 'res.country', 'search',
-                [[['name', 'ilike', cf['country']]]], {'limit': 1}
-            )
-            if country_ids:
-                partner_vals['country_id'] = country_ids[0]
-
-        # Boş alanları temizle
-        partner_vals = {k: v for k, v in partner_vals.items() if v}
-
-        contact_id = odoo_call(models, cfg, uid, 'res.partner', 'create', [partner_vals])
+            c = odoo_call(models, cfg, uid, 'res.country', 'search',
+                [[['name', 'ilike', cf['country']]]], {'limit': 1})
+            if c: vals['country_id'] = c[0]
+        # Manuel alanlar
+        for f in ['user_id', 'property_payment_term_id', 'property_supplier_payment_term_id', 'sale_currency_rate_type_id']:
+            if mf.get(f): vals[f] = mf[f]
+        contact_id = odoo_call(models, cfg, uid, 'res.partner', 'create', [vals])
         result['contact_created'] = True
-    else:
+        result['contact_id'] = contact_id
+    elif contact_id:
         result['contact_existed'] = True
+        result['contact_id'] = contact_id
 
-    result['contact_id'] = contact_id
+    # C. Görüşülen kişiler
+    def find_or_create(name, phone='', email='', parent=None):
+        if not name: return None
+        ex = odoo_call(models, cfg, uid, 'res.partner', 'search_read',
+            [[['name', '=ilike', name], ['is_company', '=', False]]],
+            {'fields': ['id'], 'limit': 1})
+        if ex: return ex[0]['id']
+        v = {'name': name, 'is_company': False}
+        if phone: v['phone'] = phone
+        if email: v['email'] = email
+        if parent: v['parent_id'] = parent
+        return odoo_call(models, cfg, uid, 'res.partner', 'create', [v])
 
-    # ── Özel modüle kayıt oluştur ──────────────────────────────────────────
-    module = req.custom_module
-    custom_vals = {
-        'x_contact_id': contact_id,
-        **{k: v for k, v in req.custom_fields.items() if v},
+    g1 = find_or_create(ff.get('gorusulen_1',''), ff.get('gorusulen_1_tel',''), ff.get('gorusulen_1_mail',''), company_id)
+    g2 = find_or_create(ff.get('gorusulen_2',''), ff.get('gorusulen_2_tel',''), ff.get('gorusulen_2_mail',''), company_id)
+
+    # D. Görüşme yapanlar (res.users)
+    def find_user(name):
+        if not name: return None
+        u = odoo_call(models, cfg, uid, 'res.users', 'search_read',
+            [[['name', 'ilike', name]]], {'fields': ['id'], 'limit': 1})
+        return u[0]['id'] if u else None
+
+    u1 = find_user(ff.get('gorusme_yapan_1',''))
+    u2 = find_user(ff.get('gorusme_yapan_2',''))
+    u3 = find_user(ff.get('gorusme_yapan_3',''))
+
+    # E. Öncelik → puan
+    puan = {'AZ': '1', 'ORTA': '2', 'ÇOK': '3', 'COK': '3'}.get(ff.get('oncelik','').upper().strip(), '1')
+
+    # F. Aksiyon
+    aksiyon_map = {
+        'ZİYARET': 'ziyaret', 'ZIYARET': 'ziyaret',
+        'TANITIM': 'tanitim',
+        'FİYAT TEKLİFİ': 'fiyat_teklifi', 'FIYAT TEKLIFI': 'fiyat_teklifi',
+        'ARAMA': 'arama', 'CRM': 'crm',
     }
+    aksiyon = aksiyon_map.get(ff.get('aksiyon_plan','').upper().strip(), '')
+
+    # G. Ziyaret kaydı
+    visit_vals = {k: v for k, v in {
+        'x_name': ff.get('fuar_adi', ''),
+        'x_studio_field_YnEYp': company_id,
+        'x_studio_field_SnOyH': ff.get('tarih', ''),
+        'x_studio_grlen': g1,
+        'x_studio_grlen_2_kii': g2,
+        'x_studio_aksiyon_sorumlusu': u1,
+        'x_studio_ziyaret_eden_2': u2,
+        'x_studio_ziyaret_eden_3': u3,
+        'x_studio_notlar': ff.get('notlar', ''),
+        'x_studio_aksiyon_plan': aksiyon,
+        'x_studio_grme': puan,
+        'x_studio_ziyaret_tipi': 'fuar',
+    }.items() if v}
 
     try:
-        record_id = odoo_call(models, cfg, uid, module, 'create', [custom_vals])
-        result['record_id'] = record_id
-        result['record_created'] = True
+        visit_id = odoo_call(models, cfg, uid, 'x_ziyaret_toplanti', 'create', [visit_vals])
+        result['visit_id'] = visit_id
+        result['visit_created'] = True
+        result['odoo_url'] = f"{cfg.url}/web#id={visit_id}&model=x_ziyaret_toplanti&view_type=form"
     except Exception as e:
-        result['record_error'] = str(e)
-        result['record_error_hint'] = (
-            f'"{module}" modülü bulunamadı veya x_contact_id alanı yok. '
-            'Odoo Studio\'dan modül teknik adını ve alanlarını kontrol edin.'
-        )
+        result['visit_error'] = str(e)
 
-    # Odoo'daki kontak URL'si
-    result['odoo_url'] = f"{cfg.url}/web#id={contact_id}&model=res.partner&view_type=form"
     result['success'] = True
-
     return result
 
-
-# ─── 4. Bağlantı Testi ───────────────────────────────────────────────────────
-
+# ─── 4. Test ──────────────────────────────────────────────────────────────────
 @app.post('/api/test-odoo')
 async def test_odoo(cfg: OdooConfig):
     try:
         common = xmlrpc.client.ServerProxy(f'{cfg.url.rstrip("/")}/xmlrpc/2/common')
         uid = common.authenticate(cfg.db, cfg.username, cfg.api_key, {})
-        if uid:
-            return {'success': True, 'uid': uid, 'message': 'Bağlantı başarılı'}
-        return {'success': False, 'message': 'Kimlik doğrulama başarısız'}
+        return {'success': bool(uid), 'uid': uid} if uid else {'success': False, 'message': 'Kimlik doğrulama başarısız'}
     except Exception as e:
         return {'success': False, 'message': str(e)}
-
 
 @app.get('/health')
 def health():
