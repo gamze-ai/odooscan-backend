@@ -116,7 +116,7 @@ class ContactMatcher:
 
     EXACT_THRESHOLD = 95    # Bu puanın üstü: kesin eşleşme
     HIGH_THRESHOLD = 80     # Bu puanın üstü: yüksek ihtimal
-    MEDIUM_THRESHOLD = 60   # Bu puanın üstü: orta ihtimal (göster ama sor)
+    MEDIUM_THRESHOLD = 40   # Bu puanın üstü: orta ihtimal (göster ama sor)
 
     def __init__(self, odoo_url: str, db: str, username: str, api_key: str):
         self.url = odoo_url.rstrip('/')
