@@ -1,7 +1,5 @@
 """
-main.py — OdooScan Backend API v2.0
-OCR + AI extraction + Odoo kontak eşleştirme + kayıt oluşturma
-MABAYCO Fuar Görüşme Raporu + Kartvizit entegrasyonu
+main.py — OdooScan Backend API v2.1
 """
 
 import base64
@@ -17,11 +15,10 @@ from pydantic import BaseModel
 
 from contact_matcher import ContactMatcher, serialize_candidates
 
-app = FastAPI(title="OdooScan API", version="2.0.0")
+app = FastAPI(title="OdooScan API", version="2.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 claude_client = anthropic.Anthropic()
 
-# ─── Modeller ─────────────────────────────────────────────────────────────────
 class OdooConfig(BaseModel):
     url: str
     db: str
@@ -31,7 +28,7 @@ class OdooConfig(BaseModel):
 class ExtractRequest(BaseModel):
     file_base64: str
     mime_type: str
-    document_type: str  # 'form' | 'businessCard' | 'both'
+    document_type: str
 
 class CheckContactRequest(BaseModel):
     odoo_config: OdooConfig
@@ -49,7 +46,6 @@ class SendToOdooRequest(BaseModel):
     selected_contact_id: Optional[int] = None
     selected_company_id: Optional[int] = None
 
-# ─── Odoo ─────────────────────────────────────────────────────────────────────
 def get_odoo(cfg: OdooConfig):
     common = xmlrpc.client.ServerProxy(f'{cfg.url.rstrip("/")}/xmlrpc/2/common')
     uid = common.authenticate(cfg.db, cfg.username, cfg.api_key, {})
@@ -61,7 +57,6 @@ def get_odoo(cfg: OdooConfig):
 def odoo_call(models, cfg, uid, model, method, args, kwargs=None):
     return models.execute_kw(cfg.db, uid, cfg.api_key, model, method, args, kwargs or {})
 
-# ─── AI Promptları ────────────────────────────────────────────────────────────
 FORM_PROMPT = """Bu bir FUAR GÖRÜŞME RAPORU formudur.
 Formdan bilgileri çıkar ve SADECE JSON döndür. Emin olmadığın alanlara boş string koy.
 
@@ -119,7 +114,6 @@ Her ikisinden bilgileri ayrı ayrı çıkar ve SADECE JSON döndür.
   }
 }"""
 
-# ─── 1. Extract ───────────────────────────────────────────────────────────────
 @app.post('/api/extract')
 async def extract(req: ExtractRequest):
     if req.mime_type == 'application/pdf':
@@ -163,7 +157,6 @@ def _pdf_to_image(pdf_b64):
     except ImportError:
         return pdf_b64
 
-# ─── 2. Kontak Kontrolü ───────────────────────────────────────────────────────
 @app.post('/api/check-contact')
 async def check_contact(req: CheckContactRequest):
     try:
@@ -180,7 +173,6 @@ async def check_contact(req: CheckContactRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ─── 3. Odoo'ya Kaydet ───────────────────────────────────────────────────────
 @app.post('/api/send-to-odoo')
 async def send_to_odoo(req: SendToOdooRequest):
     models, uid = get_odoo(req.odoo_config)
@@ -188,13 +180,17 @@ async def send_to_odoo(req: SendToOdooRequest):
     ff, cf, mf = req.form_fields, req.card_fields, req.manual_fields
     result = {}
 
-    # A. Şirket
+    # ── A. Kontak ID belirle ─────────────────────────────────────────────────
+    contact_id = req.selected_contact_id  # Kullanıcı seçtiyse bunu kullan
+
+    # ── B. Şirket belirle ────────────────────────────────────────────────────
     company_name = cf.get('company') or ff.get('sirket') or ''
     company_id = req.selected_company_id
+
     if not company_id and company_name:
         ex = odoo_call(models, cfg, uid, 'res.partner', 'search_read',
             [[['is_company', '=', True], ['name', '=ilike', company_name]]],
-            {'fields': ['id'], 'limit': 1})
+            {'fields': ['id', 'name'], 'limit': 1})
         if ex:
             company_id = ex[0]['id']
             result['company_existed'] = True
@@ -204,43 +200,57 @@ async def send_to_odoo(req: SendToOdooRequest):
             result['company_created'] = True
             result['company_id'] = company_id
 
-    # B. Kartvizit kontağı
-    contact_id = req.selected_contact_id
-    if not contact_id and cf and cf.get('name'):
-        vals = {k: v for k, v in {
-            'is_company': False,
-            'name': cf.get('name', ''),
-            'function': cf.get('function', ''),
-            'phone': cf.get('phone', ''),
-            'mobile': cf.get('mobile', ''),
-            'email': cf.get('email', ''),
-            'website': cf.get('website', ''),
-            'street': cf.get('street', ''),
-            'city': cf.get('city', ''),
-            'zip': cf.get('zip', ''),
-        }.items() if v}
-        if company_id: vals['parent_id'] = company_id
-        # state_id
-        if cf.get('state'):
-            s = odoo_call(models, cfg, uid, 'res.country.state', 'search',
-                [[['name', 'ilike', cf['state']]]], {'limit': 1})
-            if s: vals['state_id'] = s[0]
-        # country_id
-        if cf.get('country'):
-            c = odoo_call(models, cfg, uid, 'res.country', 'search',
-                [[['name', 'ilike', cf['country']]]], {'limit': 1})
-            if c: vals['country_id'] = c[0]
-        # Manuel alanlar
-        for f in ['user_id', 'property_payment_term_id', 'property_supplier_payment_term_id', 'sale_currency_rate_type_id']:
-            if mf.get(f): vals[f] = mf[f]
-        contact_id = odoo_call(models, cfg, uid, 'res.partner', 'create', [vals])
-        result['contact_created'] = True
-        result['contact_id'] = contact_id
-    elif contact_id:
+    # ── C. Yeni kontak oluştur (sadece seçilmediyse) ─────────────────────────
+    if not contact_id:
+        # Seçim yapılmadı — yeni kontak oluştur
+        if cf and cf.get('name'):
+            vals = {k: v for k, v in {
+                'is_company': False,
+                'name': cf.get('name', ''),
+                'function': cf.get('function', ''),
+                'phone': cf.get('phone', ''),
+                'mobile': cf.get('mobile', ''),
+                'email': cf.get('email', ''),
+                'website': cf.get('website', ''),
+                'street': cf.get('street', ''),
+                'city': cf.get('city', ''),
+                'zip': cf.get('zip', ''),
+            }.items() if v}
+
+            if company_id:
+                vals['parent_id'] = company_id
+
+            if cf.get('state'):
+                s = odoo_call(models, cfg, uid, 'res.country.state', 'search',
+                    [[['name', 'ilike', cf['state']]]], {'limit': 1})
+                if s: vals['state_id'] = s[0]
+
+            if cf.get('country'):
+                c = odoo_call(models, cfg, uid, 'res.country', 'search',
+                    [[['name', 'ilike', cf['country']]]], {'limit': 1})
+                if c: vals['country_id'] = c[0]
+
+            for f in ['user_id', 'property_payment_term_id',
+                      'property_supplier_payment_term_id', 'sale_currency_rate_type_id']:
+                if mf.get(f): vals[f] = mf[f]
+
+            contact_id = odoo_call(models, cfg, uid, 'res.partner', 'create', [vals])
+            result['contact_created'] = True
+            result['contact_id'] = contact_id
+    else:
+        # Kullanıcı mevcut kontağı seçti — yeni kontak oluşturma!
         result['contact_existed'] = True
         result['contact_id'] = contact_id
 
-    # C. Görüşülen kişiler
+        # Seçilen kontağın şirketini al (şirket adımı atlandıysa)
+        if not company_id:
+            existing = odoo_call(models, cfg, uid, 'res.partner', 'read',
+                [[contact_id]], {'fields': ['parent_id']})
+            if existing and existing[0].get('parent_id'):
+                company_id = existing[0]['parent_id'][0]
+                result['company_from_contact'] = True
+
+    # ── D. Görüşülen kişiler ─────────────────────────────────────────────────
     def find_or_create(name, phone='', email='', parent=None):
         if not name: return None
         ex = odoo_call(models, cfg, uid, 'res.partner', 'search_read',
@@ -256,7 +266,7 @@ async def send_to_odoo(req: SendToOdooRequest):
     g1 = find_or_create(ff.get('gorusulen_1',''), ff.get('gorusulen_1_tel',''), ff.get('gorusulen_1_mail',''), company_id)
     g2 = find_or_create(ff.get('gorusulen_2',''), ff.get('gorusulen_2_tel',''), ff.get('gorusulen_2_mail',''), company_id)
 
-    # D. Görüşme yapanlar (res.users)
+    # ── E. Görüşme yapanlar ─────────────────────────────────────────────────
     def find_user(name):
         if not name: return None
         u = odoo_call(models, cfg, uid, 'res.users', 'search_read',
@@ -267,10 +277,11 @@ async def send_to_odoo(req: SendToOdooRequest):
     u2 = find_user(ff.get('gorusme_yapan_2',''))
     u3 = find_user(ff.get('gorusme_yapan_3',''))
 
-    # E. Öncelik → puan
-    puan = {'AZ': '1', 'ORTA': '2', 'ÇOK': '3', 'COK': '3'}.get(ff.get('oncelik','').upper().strip(), '1')
+    # ── F. Öncelik → puan ───────────────────────────────────────────────────
+    puan = {'AZ': '1', 'ORTA': '2', 'ÇOK': '3', 'COK': '3'}.get(
+        ff.get('oncelik','').upper().strip(), '1')
 
-    # F. Aksiyon
+    # ── G. Aksiyon ──────────────────────────────────────────────────────────
     aksiyon_map = {
         'ZİYARET': 'ziyaret', 'ZIYARET': 'ziyaret',
         'TANITIM': 'tanitim',
@@ -279,12 +290,12 @@ async def send_to_odoo(req: SendToOdooRequest):
     }
     aksiyon = aksiyon_map.get(ff.get('aksiyon_plan','').upper().strip(), '')
 
-    # G. Ziyaret kaydı
+    # ── H. Ziyaret kaydı ────────────────────────────────────────────────────
     visit_vals = {k: v for k, v in {
         'x_name': ff.get('fuar_adi', ''),
         'x_studio_field_YnEYp': company_id,
         'x_studio_field_SnOyH': ff.get('tarih', ''),
-        'x_studio_grlen': g1,
+        'x_studio_grlen': g1 or contact_id,
         'x_studio_grlen_2_kii': g2,
         'x_studio_aksiyon_sorumlusu': u1,
         'x_studio_ziyaret_eden_2': u2,
@@ -296,17 +307,16 @@ async def send_to_odoo(req: SendToOdooRequest):
     }.items() if v}
 
     try:
-        visit_id = odoo_call(models, cfg, uid, 'x_ziyaret_toplanti', 'create', [visit_vals])
+        visit_id = odoo_call(models, cfg, uid, 'x_ziyaretler', 'create', [visit_vals])
         result['visit_id'] = visit_id
         result['visit_created'] = True
-        result['odoo_url'] = f"{cfg.url}/web#id={visit_id}&model=x_ziyaret_toplanti&view_type=form"
+        result['odoo_url'] = f"{cfg.url}/web#id={visit_id}&model=x_ziyaretler&view_type=form"
     except Exception as e:
         result['visit_error'] = str(e)
 
     result['success'] = True
     return result
 
-# ─── 4. Test ──────────────────────────────────────────────────────────────────
 @app.post('/api/test-odoo')
 async def test_odoo(cfg: OdooConfig):
     try:
