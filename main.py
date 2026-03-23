@@ -303,7 +303,7 @@ async def send_to_odoo(req: SendToOdooRequest):
         'x_studio_notlar': ff.get('notlar', ''),
         'x_studio_aksiyon_plan': aksiyon,
         'x_studio_grme': puan,
-        'x_studio_ziyaret_tipi': 'fuar',
+        'x_studio_field_TmyaU': 'Fuar',
     }.items() if v}
 
     try:
