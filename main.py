@@ -1,5 +1,5 @@
 """
-main.py — OdooScan Backend API v2.1
+main.py — OdooScan Backend API v2.2
 """
 
 import base64
@@ -28,7 +28,14 @@ def _convert_date(date_str):
     except:
         return False
 
-app = FastAPI(title="OdooScan API", version="2.1.0")
+# Türkçe karakter normalize için
+TR_MAP = str.maketrans('ığüşöçİĞÜŞÖÇ', 'igusocigusoc')
+
+def normalize_tr(text: str) -> str:
+    if not text: return ''
+    return text.strip().translate(TR_MAP).lower()
+
+app = FastAPI(title="OdooScan API", version="2.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 claude_client = anthropic.Anthropic()
 
@@ -58,6 +65,9 @@ class SendToOdooRequest(BaseModel):
     manual_fields: dict = {}
     selected_contact_id: Optional[int] = None
     selected_company_id: Optional[int] = None
+
+class OdooOptionsRequest(BaseModel):
+    odoo_config: OdooConfig
 
 def get_odoo(cfg: OdooConfig):
     common = xmlrpc.client.ServerProxy(f'{cfg.url.rstrip("/")}/xmlrpc/2/common')
@@ -194,7 +204,7 @@ async def send_to_odoo(req: SendToOdooRequest):
     result = {}
 
     # ── A. Kontak ID belirle ─────────────────────────────────────────────────
-    contact_id = req.selected_contact_id  # Kullanıcı seçtiyse bunu kullan
+    contact_id = req.selected_contact_id
 
     # ── B. Şirket belirle ────────────────────────────────────────────────────
     company_name = cf.get('company') or ff.get('sirket') or ''
@@ -215,7 +225,6 @@ async def send_to_odoo(req: SendToOdooRequest):
 
     # ── C. Yeni kontak oluştur (sadece seçilmediyse) ─────────────────────────
     if not contact_id:
-        # Seçim yapılmadı — yeni kontak oluştur
         if cf and cf.get('name'):
             vals = {k: v for k, v in {
                 'is_company': False,
@@ -251,11 +260,9 @@ async def send_to_odoo(req: SendToOdooRequest):
             result['contact_created'] = True
             result['contact_id'] = contact_id
     else:
-        # Kullanıcı mevcut kontağı seçti — yeni kontak oluşturma!
         result['contact_existed'] = True
         result['contact_id'] = contact_id
 
-        # Seçilen kontağın şirketini al (şirket adımı atlandıysa)
         if not company_id:
             existing = odoo_call(models, cfg, uid, 'res.partner', 'read',
                 [[contact_id]], {'fields': ['parent_id']})
@@ -279,12 +286,24 @@ async def send_to_odoo(req: SendToOdooRequest):
     g1 = find_or_create(ff.get('gorusulen_1',''), ff.get('gorusulen_1_tel',''), ff.get('gorusulen_1_mail',''), company_id)
     g2 = find_or_create(ff.get('gorusulen_2',''), ff.get('gorusulen_2_tel',''), ff.get('gorusulen_2_mail',''), company_id)
 
-    # ── E. Görüşme yapanlar ─────────────────────────────────────────────────
+    # ── E. Görüşme yapanlar — büyük/küçük harf + Türkçe karakter duyarsız ──
     def find_user(name):
         if not name: return None
-        u = odoo_call(models, cfg, uid, 'res.users', 'search_read',
-            [[['name', 'ilike', name]]], {'fields': ['id'], 'limit': 1})
-        return u[0]['id'] if u else None
+        norm_target = normalize_tr(name)
+        # Tüm aktif dahili kullanıcıları çek, Python tarafında karşılaştır
+        users = odoo_call(models, cfg, uid, 'res.users', 'search_read',
+            [[['active', '=', True], ['share', '=', False]]],
+            {'fields': ['id', 'name'], 'limit': 500})
+        # Önce tam eşleşme dene
+        for u in users:
+            if normalize_tr(u['name']) == norm_target:
+                return u['id']
+        # Tam eşleşme yoksa kısmi eşleşme dene
+        for u in users:
+            u_norm = normalize_tr(u['name'])
+            if norm_target in u_norm or u_norm in norm_target:
+                return u['id']
+        return None
 
     u1 = find_user(ff.get('gorusme_yapan_1',''))
     u2 = find_user(ff.get('gorusme_yapan_2',''))
@@ -301,10 +320,6 @@ async def send_to_odoo(req: SendToOdooRequest):
         "FİYAT TEKLİFİ": "Fiyat Teklifi", "FIYAT TEKLIFI": "Fiyat Teklifi",
         "ARAMA": "Arama", "CRM": "CRM",
     }
-
-
-
-
     aksiyon = aksiyon_map.get(ff.get('aksiyon_plan','').upper().strip(), '')
 
     # ── H. Ziyaret kaydı ────────────────────────────────────────────────────
@@ -334,14 +349,57 @@ async def send_to_odoo(req: SendToOdooRequest):
     result['success'] = True
     return result
 
-@app.post('/api/test-odoo')
-async def test_odoo(cfg: OdooConfig):
+@app.post('/api/odoo-options')
+async def get_odoo_options(req: OdooOptionsRequest):
+    """Frontend dropdown'ları için Odoo'dan seçenek listelerini dinamik çeker."""
+    try:
+        models, uid = get_odoo(req.odoo_config)
+        cfg = req.odoo_config
+
+        # Satış Temsilcisi — dahili aktif kullanıcılar
+        users = odoo_call(models, cfg, uid, 'res.users', 'search_read',
+            [[['active', '=', True], ['share', '=', False]]],
+            {'fields': ['id', 'name'], 'limit': 500, 'order': 'name asc'})
+        users_list = [{'id': u['id'], 'name': u['name']} for u in users]
+
+        # Ödeme Koşulları (Müşteri + Tedarikçi için aynı liste)
+        payment_terms = odoo_call(models, cfg, uid, 'account.payment.term', 'search_read',
+            [[['active', '=', True]]],
+            {'fields': ['id', 'name'], 'limit': 200, 'order': 'name asc'})
+        pt_list = [{'id': p['id'], 'name': p['name']} for p in payment_terms]
+
+        # Satış Kur Türü — res.currency.rate.type
+        currency_rate_types = []
+        try:
+            crt = odoo_call(models, cfg, uid, 'res.currency.rate.type', 'search_read',
+                [[]],
+                {'fields': ['id', 'name'], 'limit': 100, 'order': 'name asc'})
+            currency_rate_types = [{'id': c['id'], 'name': c['name']} for c in crt]
+        except Exception:
+            pass  # Model bazı Odoo kurulumlarında olmayabilir
+
+        return {
+            'users': users_list,
+            'payment_terms': pt_list,
+            'currency_rate_types': currency_rate_types,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/api/test-connection')
+async def test_connection(cfg: OdooConfig):
+    """Ayarlar ekranındaki bağlantı test butonu için."""
     try:
         common = xmlrpc.client.ServerProxy(f'{cfg.url.rstrip("/")}/xmlrpc/2/common')
         uid = common.authenticate(cfg.db, cfg.username, cfg.api_key, {})
         return {'success': bool(uid), 'uid': uid} if uid else {'success': False, 'message': 'Kimlik doğrulama başarısız'}
     except Exception as e:
         return {'success': False, 'message': str(e)}
+
+@app.post('/api/test-odoo')
+async def test_odoo(cfg: OdooConfig):
+    """Eski endpoint — geriye dönük uyumluluk için."""
+    return await test_connection(cfg)
 
 @app.get('/health')
 def health():
